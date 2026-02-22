@@ -63,6 +63,7 @@
 // Error codes
 #define ERROR_INITRADIO     0x01
 #define ERROR_TXFAILED      0x02
+#define ERROR_QUEUE_FULL    0x04
 
 // Protocol limits
 #define HW_MTU       508
