@@ -45,8 +45,11 @@ Flash usage: ~55KB / 62KB available (2KB reserved for bootloader). RAM: ~7KB / 2
 Firmware uploads go over the existing USB-C cable using a 2KB [HID bootloader](https://github.com/Serasidis/STM32_HID_Bootloader) (driverless on all platforms). SWD is only needed once to flash the bootloader itself.
 
 ```bash
-pio run -t upload
+./upload.sh          # build, flash, rebind serial port (Linux)
+pio run -t upload    # build and flash only (macOS/Windows)
 ```
+
+On Linux, use `upload.sh` — it runs the upload then rebinds the `cdc_acm` driver so the serial port works immediately. The CDC→HID→CDC USB re-enumeration during upload leaves the kernel tty in a stale state otherwise.
 
 ### One-time bootloader setup (SWD)
 
@@ -178,6 +181,7 @@ A clean-room implementation in `kiss.cpp`, `kiss.h`, and `main.cpp` (~600 lines 
 | `src/kiss.cpp` | KISS state machine and frame escaping |
 | `src/main.cpp` | USB CDC, radio init, command handlers, CSMA, TX/RX, diagnostics |
 | `platformio.ini` | Build configuration and pin definitions |
+| `upload.sh` | Build, flash, and rebind cdc_acm (Linux) |
 
 ## License
 
