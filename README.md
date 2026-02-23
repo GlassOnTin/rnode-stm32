@@ -96,6 +96,24 @@ The `hid-flash` CLI tool is required on the host. PlatformIO does not bundle it.
 - An **nRF5340-DK** (or any board with an onboard J-Link) can be used as an SWD programmer by routing its debug-out header to the E22P.
 - SWD can still flash firmware directly to `0x08000800` as a fallback if USB upload is unavailable.
 
+### Linux udev rules
+
+The STM32's USB CDC implementation requires `hupcl` to be disabled on the tty, otherwise the kernel drops DTR on port close and the tty becomes unresponsive until rebound. Install these rules to fix this automatically:
+
+```bash
+# HID bootloader permissions (for upload without sudo)
+sudo tee /etc/udev/rules.d/99-stm32-hid-bootloader.rules << 'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="beba", MODE="0666"
+EOF
+
+# CDC serial port fix (disable hupcl to prevent stale tty)
+sudo tee /etc/udev/rules.d/99-stm32-cdc.rules << 'EOF'
+ACTION=="add", SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", RUN+="/bin/stty -F /dev/%k -hupcl"
+EOF
+
+sudo udevadm control --reload-rules
+```
+
 ## Reticulum configuration
 
 Add to `~/.reticulum/config`:

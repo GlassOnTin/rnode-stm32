@@ -30,7 +30,8 @@ if [ -z "$INTF" ]; then
 fi
 
 echo "Rebinding cdc_acm ($INTF)..."
-sudo sh -c "echo '$INTF' > /sys/bus/usb/drivers/cdc_acm/unbind"
+sudo -A sh -c "echo '$INTF' > /sys/bus/usb/drivers/cdc_acm/unbind"
 sleep 0.5
-sudo sh -c "echo '$INTF' > /sys/bus/usb/drivers/cdc_acm/bind"
+sudo -A sh -c "echo '$INTF' > /sys/bus/usb/drivers/cdc_acm/bind"
+sleep 2
 echo "Done — serial port ready"
