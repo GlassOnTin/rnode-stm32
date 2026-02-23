@@ -38,27 +38,55 @@ Requires [PlatformIO](https://platformio.org/).
 pio run
 ```
 
-Flash usage: ~55KB / 64KB. RAM: ~7KB / 20KB.
+Flash usage: ~55KB / 62KB available (2KB reserved for bootloader). RAM: ~7KB / 20KB.
 
 ## Flashing
 
-The E22P board has SWD pads (SWDIO, SWCLK) accessible via CON2. The STM32's NRST is also accessible nearby. A J-Link or ST-Link programmer is required.
+Firmware uploads go over the existing USB-C cable using a 2KB [HID bootloader](https://github.com/Serasidis/STM32_HID_Bootloader) (driverless on all platforms). SWD is only needed once to flash the bootloader itself.
 
 ```bash
-# Using PlatformIO (J-Link) — works if NRST is wired
 pio run -t upload
+```
 
-# Using OpenOCD (J-Link, no NRST required)
+### One-time bootloader setup (SWD)
+
+The E22P board has SWD pads (SWDIO, SWCLK) accessible via CON2. Flash the HID bootloader once:
+
+```bash
+# Download and extract bootloader (STM32F103 low/medium density, LED on PC13)
+wget -O /tmp/stm32_binaries.zip \
+  https://github.com/Serasidis/STM32_HID_Bootloader/releases/download/2.2.2/stm32_binaries.zip
+unzip -j /tmp/stm32_binaries.zip \
+  "stm32_binaries/F103/low_and_medium_density/hid_generic_pc13.bin" -d /tmp
+
+# Flash bootloader at 0x08000000
 openocd -f interface/jlink.cfg -c "transport select swd" \
   -f target/stm32f1x.cfg -c "reset_config none separate" \
   -c "init" -c "reset halt" \
-  -c "flash write_image erase .pio/build/rnode_e22p/firmware.bin 0x08000000" \
+  -c "flash write_image erase /tmp/hid_generic_pc13.bin 0x08000000" \
   -c "reset run" -c "shutdown"
+
+# Flash firmware at 0x08000800 (first time only, subsequent uploads use USB)
+openocd -f interface/jlink.cfg -c "transport select swd" \
+  -f target/stm32f1x.cfg -c "reset_config none separate" \
+  -c "init" -c "reset halt" \
+  -c "flash write_image erase .pio/build/rnode_e22p/firmware.bin 0x08000800" \
+  -c "reset run" -c "shutdown"
+```
+
+The `hid-flash` CLI tool is required on the host. PlatformIO does not bundle it. Build from [source](https://github.com/Serasidis/STM32_HID_Bootloader/tree/master/cli) (`make` in the `cli/` directory) and install to PATH.
+
+### Flash layout
+
+```
+0x08000000  HID Bootloader (2 KB)
+0x08000800  RNode Firmware  (62 KB available)
+0x08010000  End of flash
 ```
 
 ### Notes
 
-- **JLink via PlatformIO often fails** on this board because the nRF5340-DK's onboard J-Link cannot assert the STM32's NRST pin over the SWD wires alone. Use the **openocd command above** with `reset_config none separate` which avoids the reset pin dependency.
+- **JLink via PlatformIO often fails** on this board because the nRF5340-DK's onboard J-Link cannot assert the STM32's NRST pin over the SWD wires alone. Use the **openocd commands above** with `reset_config none separate` which avoids the reset pin dependency.
 - The factory firmware has **read protection (RDP)** enabled. You must unlock it first, which triggers a mass erase:
   ```bash
   openocd -f interface/jlink.cfg -c "transport select swd" \
@@ -66,6 +94,7 @@ openocd -f interface/jlink.cfg -c "transport select swd" \
     -c "init; reset halt; flash protect 0 0 last off; reset halt; flash write_image erase firmware.bin 0x08000000; reset run; shutdown"
   ```
 - An **nRF5340-DK** (or any board with an onboard J-Link) can be used as an SWD programmer by routing its debug-out header to the E22P.
+- SWD can still flash firmware directly to `0x08000800` as a fallback if USB upload is unavailable.
 
 ## Reticulum configuration
 
