@@ -3,6 +3,8 @@
 #include <RadioLib.h>
 #include "kiss.h"
 
+extern "C" void CDC_reset_transmit(void);
+
 // ---------------------------------------------------------------------------
 // Hardware setup
 // ---------------------------------------------------------------------------
@@ -33,6 +35,8 @@ static bool radio_ready = false;
 static bool rx_active = false;
 static volatile bool dio1_flag = false;
 static bool transmitting = false;
+static bool host_active = false;
+static uint32_t last_host_rx_ms = 0;
 
 // Current radio parameters
 static uint32_t cfg_frequency = 0;
@@ -42,8 +46,20 @@ static uint8_t  cfg_sf        = 0;
 static uint8_t  cfg_cr        = 0;
 static uint8_t  cfg_state     = RADIO_STATE_OFF;
 
-// CSMA state
-static uint8_t csma_buf[HW_MTU];
+// 32-bit magic guard: random corruption is vanishingly unlikely to produce
+// this exact value, so we gate all radio-dependent periodic behavior on it
+// rather than on cfg_state (which is a single byte easily corrupted to 0x01).
+#define RADIO_MAGIC 0xA5B4C3D2UL
+static uint32_t radio_on_magic = 0;
+
+// CSMA state — 64-byte guard zone after buffer to absorb any overflow.
+// Memory corruption was observed writing to addresses immediately after
+// csma_buf, corrupting cfg_state and other radio config variables.
+static struct {
+    uint8_t data[HW_MTU];
+    uint8_t guard[64];
+} csma_storage;
+#define csma_buf csma_storage.data
 static size_t  csma_len = 0;
 static bool    csma_pending = false;
 static uint32_t csma_next_ms = 0;
@@ -518,6 +534,7 @@ static void on_kiss_frame(uint8_t cmd, const uint8_t *data, size_t len) {
     case CMD_RADIO_STATE:
         if (len >= 1) {
             cfg_state = data[0];
+            radio_on_magic = (cfg_state == RADIO_STATE_ON) ? RADIO_MAGIC : 0;
             if (cfg_state == RADIO_STATE_ON && radio_ready) {
                 compute_csma_params();
                 start_rx();
@@ -582,6 +599,7 @@ static void on_kiss_frame(uint8_t cmd, const uint8_t *data, size_t len) {
 
     case CMD_LEAVE:
         cfg_state = RADIO_STATE_OFF;
+        radio_on_magic = 0;
         radio.standby();
         rx_active = false;
         csma_pending = false;
@@ -628,6 +646,7 @@ void setup() {
     last_temp_ms    = now;
 
     kiss_init(&parser, on_kiss_frame);
+    memset(csma_storage.guard, 0xAA, sizeof(csma_storage.guard));
 
     // Brief LED flash to indicate ready
     digitalWrite(LED_TX, HIGH);
@@ -639,12 +658,40 @@ void setup() {
 // Arduino main loop
 // ---------------------------------------------------------------------------
 void loop() {
+    // Detect new host session: data arrived after > 2s silence.
+    // Reset transmit state BEFORE processing any data so the first
+    // response in the new session isn't blocked by stale TxState
+    // or queued behind old data.
+    if (Serial.available() && millis() - last_host_rx_ms >= 2000UL) {
+        CDC_reset_transmit();
+        kiss_init(&parser, on_kiss_frame);
+        uint32_t rx_now = millis();
+        last_chtm_ms = rx_now;
+        last_temp_ms = rx_now;
+    }
+
     // Process incoming USB data
     while (Serial.available()) {
         kiss_process_byte(&parser, (uint8_t)Serial.read());
+        last_host_rx_ms = millis();
+        host_active = true;
     }
 
     uint32_t now = millis();
+
+    // Consider host gone if no data received for 5 seconds
+    if (host_active && (now - last_host_rx_ms >= 5000UL)) {
+        host_active = false;
+    }
+
+    // If cfg_state got corrupted but radio_on_magic doesn't match,
+    // silently fix cfg_state.  The 32-bit magic makes false positives
+    // from random corruption vanishingly unlikely.
+    if (cfg_state == RADIO_STATE_ON && radio_on_magic != RADIO_MAGIC) {
+        cfg_state = RADIO_STATE_OFF;
+        radio.standby();
+        rx_active = false;
+    }
 
     // DIO1 interrupt: TX complete or RX packet
     if (dio1_flag) {
@@ -674,15 +721,19 @@ void loop() {
         sample_channel_rssi();
     }
 
-    // Periodic channel time report
-    if (cfg_state == RADIO_STATE_ON && now - last_chtm_ms >= CHTM_INTERVAL_MS) {
-        last_chtm_ms = now;
-        send_chtm(now);
+    // Periodic channel/airtime report (only when radio legitimately on)
+    if (host_active && radio_on_magic == RADIO_MAGIC) {
+        if (now - last_chtm_ms >= CHTM_INTERVAL_MS) {
+            last_chtm_ms = now;
+            send_chtm(now);
+        }
     }
 
     // Periodic temperature report
-    if (now - last_temp_ms >= TEMP_INTERVAL_MS) {
-        last_temp_ms = now;
-        read_temperature();
+    if (host_active && radio_on_magic == RADIO_MAGIC) {
+        if (now - last_temp_ms >= TEMP_INTERVAL_MS) {
+            last_temp_ms = now;
+            read_temperature();
+        }
     }
 }
