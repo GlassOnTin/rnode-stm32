@@ -44,12 +44,26 @@ Flash usage: ~55KB / 62KB available (2KB reserved for bootloader). RAM: ~7KB / 2
 
 Firmware uploads go over the existing USB-C cable using a 2KB [HID bootloader](https://github.com/Serasidis/STM32_HID_Bootloader) (driverless on all platforms). SWD is only needed once to flash the bootloader itself.
 
+The `hid-flash` CLI tool is required. PlatformIO does not bundle it — build from [source](https://github.com/Serasidis/STM32_HID_Bootloader/tree/master/cli) (`make` in the `cli/` directory) and install to PATH.
+
 ```bash
 ./upload.sh          # build, flash, rebind serial port (Linux)
 pio run -t upload    # build and flash only (macOS/Windows)
 ```
 
 On Linux, use `upload.sh` — it runs the upload then rebinds the `cdc_acm` driver so the serial port works immediately. The CDC→HID→CDC USB re-enumeration during upload leaves the kernel tty in a stale state otherwise.
+
+### Remote flashing
+
+When the E22P is connected to a remote Linux host (e.g. an OpenWrt router), build locally and flash over SSH:
+
+```bash
+pio run -e rnode_e22p
+scp -O .pio/build/rnode_e22p/firmware.bin root@host:/tmp/firmware.bin
+ssh root@host 'hid-flash /tmp/firmware.bin ttyACM0'
+```
+
+The remote host needs `hid-flash` (build from source for its architecture) and USB HID kernel support. On OpenWrt this means installing `kmod-usb-hid` and `kmod-hid-generic` — without them the bootloader device (1209:BEBA) is invisible and `hid-flash` fails silently.
 
 ### One-time bootloader setup (SWD)
 
@@ -77,8 +91,6 @@ openocd -f interface/jlink.cfg -c "transport select swd" \
   -c "reset run" -c "shutdown"
 ```
 
-The `hid-flash` CLI tool is required on the host. PlatformIO does not bundle it. Build from [source](https://github.com/Serasidis/STM32_HID_Bootloader/tree/master/cli) (`make` in the `cli/` directory) and install to PATH.
-
 ### Flash layout
 
 ```
@@ -98,6 +110,7 @@ The `hid-flash` CLI tool is required on the host. PlatformIO does not bundle it.
   ```
 - An **nRF5340-DK** (or any board with an onboard J-Link) can be used as an SWD programmer by routing its debug-out header to the E22P.
 - SWD can still flash firmware directly to `0x08000800` as a fallback if USB upload is unavailable.
+- **OpenWrt/embedded Linux hosts** need `kmod-usb-hid` and `kmod-hid-generic` installed. The HID bootloader enumerates as a USB HID device (1209:BEBA) — without these modules the kernel can't bind it and `hid-flash` silently fails.
 
 ### Linux udev rules
 

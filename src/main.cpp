@@ -17,6 +17,7 @@ static SX1262 radio = new Module(P_LORA_NSS, P_LORA_DIO_1, P_LORA_RESET, P_LORA_
 #define CSMA_P           128     // p=0.5 out of 256
 #define CSMA_MAX_RETRIES 32
 #define CSMA_RSSI_FLOOR  (-90)   // default threshold dBm
+#define CSMA_SENSE_MARGIN 15.0f  // dB above measured noise floor = "busy"
 
 // Timing constants
 #define ST_WINDOW_MS     15000UL
@@ -91,12 +92,23 @@ static uint32_t last_temp_ms = 0;
 // LED RX auto-off
 static uint32_t led_rx_off_ms = 0;
 
+// RX diagnostics
+static uint32_t diag_dio1_count = 0;
+static uint32_t diag_rx_pkt_count = 0;
+static uint32_t diag_rx_start_fail = 0;
+static uint32_t diag_crc_err_count = 0;
+static uint32_t diag_hdr_count = 0;
+
 // Simple PRNG (xorshift16)
 static uint16_t prng_s = 1;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+static inline float csma_threshold() {
+    return noise_floor_f + CSMA_SENSE_MARGIN;
+}
+
 static uint8_t prng_next() {
     prng_s ^= prng_s << 7;
     prng_s ^= prng_s >> 9;
@@ -133,6 +145,7 @@ static void kiss_send_u32(uint8_t cmd, uint32_t val) {
 // ---------------------------------------------------------------------------
 static void dio1_isr() {
     dio1_flag = true;
+    diag_dio1_count++;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +217,12 @@ static void send_phyprm() {
 // Start continuous RX
 // ---------------------------------------------------------------------------
 static void start_rx() {
-    radio.startReceive();
+    int16_t st = radio.startReceive();
+    if (st != RADIOLIB_ERR_NONE) {
+        diag_rx_start_fail++;
+        rx_active = false;
+        return;
+    }
     rx_active = true;
 }
 
@@ -242,7 +260,7 @@ static void csma_check() {
     // Read instantaneous RSSI while in RX
     float rssi = radio.getRSSI(false);
 
-    if (rssi < (float)CSMA_RSSI_FLOOR) {
+    if (rssi < csma_threshold()) {
         // Channel clear — p-persistent
         if (prng_next() < CSMA_P) {
             do_transmit();
@@ -264,6 +282,7 @@ static void csma_check() {
 // Handle received packet
 // ---------------------------------------------------------------------------
 static void handle_rx_packet() {
+    diag_rx_pkt_count++;
     size_t len = radio.getPacketLength();
     if (len == 0 || len > HW_MTU) {
         start_rx();
@@ -369,7 +388,7 @@ static void sample_channel_rssi() {
         noise_floor_f = rssi;
     }
 
-    bool busy = (rssi >= (float)CSMA_RSSI_FLOOR);
+    bool busy = (rssi >= csma_threshold());
     ch_st_samples++;
     ch_lt_samples++;
     if (busy) {
@@ -721,11 +740,47 @@ void loop() {
         sample_channel_rssi();
     }
 
+    // Poll SX1262 IRQ status for CRC errors and headers (not routed to DIO1)
+    {
+        static uint32_t last_diag_ms = 0;
+        if (now - last_diag_ms >= 500UL && rx_active && !transmitting) {
+            last_diag_ms = now;
+            uint16_t irq = (uint16_t)radio.getIrqFlags();
+            if (irq & RADIOLIB_SX126X_IRQ_CRC_ERR) {
+                diag_crc_err_count++;
+            }
+            if (irq & RADIOLIB_SX126X_IRQ_HEADER_VALID) {
+                diag_hdr_count++;
+            }
+        }
+    }
+
     // Periodic channel/airtime report (only when radio legitimately on)
     if (host_active && radio_on_magic == RADIO_MAGIC) {
         if (now - last_chtm_ms >= CHTM_INTERVAL_MS) {
             last_chtm_ms = now;
             send_chtm(now);
+
+            // RX diagnostics report
+            // status byte: bit0=rx_active, bit1=transmitting, bit2=csma_pending
+            {
+                uint8_t sw_status = (rx_active ? 1 : 0)
+                                  | (transmitting ? 2 : 0)
+                                  | (csma_pending ? 4 : 0);
+                uint8_t diag[11];
+                diag[0]  = (uint8_t)(diag_dio1_count >> 8);
+                diag[1]  = (uint8_t)(diag_dio1_count);
+                diag[2]  = (uint8_t)(diag_rx_pkt_count >> 8);
+                diag[3]  = (uint8_t)(diag_rx_pkt_count);
+                diag[4]  = (uint8_t)(diag_rx_start_fail >> 8);
+                diag[5]  = (uint8_t)(diag_rx_start_fail);
+                diag[6]  = (uint8_t)(diag_crc_err_count >> 8);
+                diag[7]  = (uint8_t)(diag_crc_err_count);
+                diag[8]  = (uint8_t)(diag_hdr_count >> 8);
+                diag[9]  = (uint8_t)(diag_hdr_count);
+                diag[10] = sw_status;
+                kiss_send(CMD_STAT_CSMA, diag, 11);
+            }
         }
     }
 
