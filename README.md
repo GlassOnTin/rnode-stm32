@@ -38,7 +38,7 @@ Requires [PlatformIO](https://platformio.org/).
 pio run
 ```
 
-Flash usage: ~55KB / 62KB available (2KB reserved for bootloader). RAM: ~7KB / 20KB.
+Flash usage: ~55KB / 62KB available (2KB reserved for bootloader). RAM: ~8KB / 20KB.
 
 ## Flashing
 
@@ -170,6 +170,12 @@ EOF
 sudo udevadm control --reload-rules
 ```
 
+## USB CDC notes
+
+The STM32 Arduino USB CDC driver has a receive queue that defaults to 3 USB packets (192 bytes). When the host sends large KISS frames back-to-back (as `rnsd` does without flow control), this queue overflows and causes a hard fault. The build sets `CDC_RECEIVE_QUEUE_BUFFER_PACKET_NUMBER=16` (1024 bytes) to prevent this.
+
+The `CDC_unstick_tx()` function (added to the framework's `usbd_cdc_if.c`) periodically clears stale USB IN transfer state. On STM32F103 CDC-ACM, the host may be slow to poll the IN endpoint, leaving `TxState=1` indefinitely and blocking all `Serial.write()` calls.
+
 ## Reticulum configuration
 
 Add to `~/.reticulum/config`:
@@ -191,7 +197,7 @@ Add to `~/.reticulum/config`:
 Verify with:
 
 ```bash
-rnodeconf /dev/ttyACM0 --info    # Should show firmware version 1.60
+rnodeconf /dev/ttyACM0 --info    # Should show firmware version 1.62
 rnstatus                          # Should show RNode LoRa interface as Up
 ```
 
@@ -206,6 +212,8 @@ rnstatus                          # Should show RNode LoRa interface as Up
 **Radio**
 - Non-blocking TX via `startTransmit()` + DIO1 ISR (USB serial stays responsive during TX)
 - p-persistent CSMA/CA (p=0.5) with carrier sense before transmit
+- TX guards: rejects packets >255 bytes (SX1262 LoRa max) and back-to-back TX while CSMA pending
+- DIO2 RF switch disabled — E22P uses MCU-driven TXEN/RXEN, not SX1262 DIO2
 - RSSI and SNR reporting per received packet
 - CMD_RANDOM, CMD_BLINK, CMD_RESET
 
@@ -220,21 +228,25 @@ rnstatus                          # Should show RNode LoRa interface as Up
 
 - **Radio init failure**: both LEDs blink continuously; USB CDC still enumerates but no commands are processed.
 - **TX failure** (`startTransmit` returns error): CMD_ERROR with `ERROR_TXFAILED` (0x02) is sent to the host, radio returns to RX.
+- **Oversized packet** (>255 bytes): CMD_ERROR with `ERROR_TXFAILED` (0x02), packet is rejected before reaching CSMA.
+- **Back-to-back TX**: CMD_ERROR with `ERROR_QUEUE_FULL` (0x04) if a packet arrives while CSMA is already pending.
 - **Airtime limit exceeded**: CMD_ERROR with `ERROR_QUEUE_FULL` (0x04), packet is dropped.
 - **Malformed KISS frames**: the parser silently discards invalid escape sequences and oversized frames.
 - **CSMA timeout**: after 32 busy-channel retries, the packet is transmitted anyway to avoid indefinite blocking.
 
 ## Architecture
 
-A clean-room implementation in `kiss.cpp`, `kiss.h`, and `main.cpp` (~600 lines of application code, excluding RadioLib). Not a fork of [RNode_Firmware](https://github.com/markqvist/RNode_Firmware) — the KISS protocol is simple enough to implement from scratch, avoiding the ESP32/NRF52/AVR complexity of the upstream project.
+A clean-room implementation in `kiss.cpp`, `kiss.h`, and `main.cpp` (~770 lines of application code, excluding RadioLib). Not a fork of [RNode_Firmware](https://github.com/markqvist/RNode_Firmware) — the KISS protocol is simple enough to implement from scratch, avoiding the ESP32/NRF52/AVR complexity of the upstream project.
 
 | File | Purpose |
 |------|---------|
 | `src/kiss.h` | KISS constants and parser/builder API |
 | `src/kiss.cpp` | KISS state machine and frame escaping |
 | `src/main.cpp` | USB CDC, radio init, command handlers, CSMA, TX/RX, diagnostics |
+| `src/diag_main.cpp` | Standalone diagnostic firmware (separate build target `diag_e22p`) |
 | `platformio.ini` | Build configuration and pin definitions |
 | `upload.sh` | Build, flash, and rebind cdc_acm (Linux) |
+| `remote_flash.sh` | Build, scp, and flash to remote host over SSH |
 
 ## License
 
