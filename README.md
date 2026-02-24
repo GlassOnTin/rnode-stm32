@@ -55,13 +55,53 @@ On Linux, use `upload.sh` — it runs the upload then rebinds the `cdc_acm` driv
 
 ### Remote flashing
 
-When the E22P is connected to a remote Linux host (e.g. an OpenWrt router), build locally and flash over SSH:
+When the E22P is connected to a remote Linux host (e.g. an OpenWrt router), use `remote_flash.sh`:
+
+```bash
+./remote_flash.sh root@192.168.0.2
+```
+
+Or manually:
 
 ```bash
 pio run -e rnode_e22p
 scp -O .pio/build/rnode_e22p/firmware.bin root@host:/tmp/firmware.bin
-ssh root@host 'hid-flash /tmp/firmware.bin ttyACM0'
 ```
+
+On OpenWrt, `hid-flash` cannot toggle DTR to enter the bootloader (the CDC ACM driver doesn't support DTR ioctl). Use Python to trigger the STM32duino `BL_HID` entry sequence instead:
+
+```bash
+ssh root@host 'python3 -c "
+import os, fcntl, struct, time, termios, glob
+fd = os.open(\"/dev/ttyACM0\", os.O_RDWR | os.O_NOCTTY)
+attrs = termios.tcgetattr(fd)
+attrs[4] = attrs[5] = termios.B115200
+termios.tcsetattr(fd, termios.TCSANOW, attrs)
+TIOCMBIS, TIOCMBIC, TIOCM_DTR = 0x5416, 0x5417, 0x002
+for i in range(4):
+    fcntl.ioctl(fd, TIOCMBIS, struct.pack(\"I\", TIOCM_DTR))
+    time.sleep(0.05)
+    fcntl.ioctl(fd, TIOCMBIC, struct.pack(\"I\", TIOCM_DTR))
+    time.sleep(0.05)
+os.write(fd, b\"1EAF\")
+os.close(fd)
+for i in range(50):
+    time.sleep(0.1)
+    for d in glob.glob(\"/sys/bus/usb/devices/*/idVendor\"):
+        base = os.path.dirname(d)
+        try:
+            vid = open(d).read().strip()
+            pid = open(os.path.join(base, \"idProduct\")).read().strip()
+            if vid == \"1209\" and pid == \"beba\":
+                raise SystemExit(0)
+        except SystemExit: raise
+        except: pass
+raise SystemExit(1)
+"'
+ssh root@host '/tmp/hid-flash /tmp/firmware.bin ttyACM0'
+```
+
+The bootloader entry works by toggling DTR 4 times (STM32duino's `DTR_TOGGLING_SEQ` counter) then sending the `1EAF` magic string, which triggers `BL_HID` to write a magic value to the backup register and reset into HID bootloader mode.
 
 The remote host needs `hid-flash` (build from source for its architecture) and USB HID kernel support. On OpenWrt this means installing `kmod-usb-hid` and `kmod-hid-generic` — without them the bootloader device (1209:BEBA) is invisible and `hid-flash` fails silently.
 

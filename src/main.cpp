@@ -3,7 +3,7 @@
 #include <RadioLib.h>
 #include "kiss.h"
 
-extern "C" void CDC_reset_transmit(void);
+extern "C" void CDC_unstick_tx(void);
 
 // ---------------------------------------------------------------------------
 // Hardware setup
@@ -92,13 +92,6 @@ static uint32_t last_temp_ms = 0;
 // LED RX auto-off
 static uint32_t led_rx_off_ms = 0;
 
-// RX diagnostics
-static uint32_t diag_dio1_count = 0;
-static uint32_t diag_rx_pkt_count = 0;
-static uint32_t diag_rx_start_fail = 0;
-static uint32_t diag_crc_err_count = 0;
-static uint32_t diag_hdr_count = 0;
-
 // Simple PRNG (xorshift16)
 static uint16_t prng_s = 1;
 
@@ -145,7 +138,6 @@ static void kiss_send_u32(uint8_t cmd, uint32_t val) {
 // ---------------------------------------------------------------------------
 static void dio1_isr() {
     dio1_flag = true;
-    diag_dio1_count++;
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +162,7 @@ static bool init_radio() {
     radio.setCRC(1);
     radio.setRxBoostedGainMode(true);
     radio.setRfSwitchPins(SX126X_RXEN, SX126X_TXEN);
+    radio.setDio2AsRfSwitch(false);
     radio.setDio1Action(dio1_isr);
 
     return true;
@@ -219,7 +212,6 @@ static void send_phyprm() {
 static void start_rx() {
     int16_t st = radio.startReceive();
     if (st != RADIOLIB_ERR_NONE) {
-        diag_rx_start_fail++;
         rx_active = false;
         return;
     }
@@ -282,7 +274,6 @@ static void csma_check() {
 // Handle received packet
 // ---------------------------------------------------------------------------
 static void handle_rx_packet() {
-    diag_rx_pkt_count++;
     size_t len = radio.getPacketLength();
     if (len == 0 || len > HW_MTU) {
         start_rx();
@@ -585,6 +576,14 @@ static void on_kiss_frame(uint8_t cmd, const uint8_t *data, size_t len) {
         if (len > 0 && len <= HW_MTU && radio_ready
             && cfg_state == RADIO_STATE_ON && !transmitting)
         {
+            if (len > 255) {
+                kiss_send_byte(CMD_ERROR, ERROR_TXFAILED);
+                break;
+            }
+            if (csma_pending) {
+                kiss_send_byte(CMD_ERROR, ERROR_QUEUE_FULL);
+                break;
+            }
             uint32_t now = millis();
             if (airtime_limited(now)) {
                 kiss_send_byte(CMD_ERROR, ERROR_QUEUE_FULL);
@@ -682,7 +681,6 @@ void loop() {
     // response in the new session isn't blocked by stale TxState
     // or queued behind old data.
     if (Serial.available() && millis() - last_host_rx_ms >= 2000UL) {
-        CDC_reset_transmit();
         kiss_init(&parser, on_kiss_frame);
         uint32_t rx_now = millis();
         last_chtm_ms = rx_now;
@@ -701,6 +699,18 @@ void loop() {
     // Consider host gone if no data received for 5 seconds
     if (host_active && (now - last_host_rx_ms >= 5000UL)) {
         host_active = false;
+    }
+
+    // Periodically unstick CDC TxState if it gets stuck
+    // TxState=1 means a USB IN transfer was started but never completed.
+    // On STM32F103 CDC-ACM this can happen if the host is slow to poll.
+    // Unlike CDC_reset_transmit(), this preserves queued data.
+    {
+        static uint32_t last_unstick_ms = 0;
+        if (now - last_unstick_ms >= 50UL) {
+            last_unstick_ms = now;
+            CDC_unstick_tx();
+        }
     }
 
     // If cfg_state got corrupted but radio_on_magic doesn't match,
@@ -740,47 +750,11 @@ void loop() {
         sample_channel_rssi();
     }
 
-    // Poll SX1262 IRQ status for CRC errors and headers (not routed to DIO1)
-    {
-        static uint32_t last_diag_ms = 0;
-        if (now - last_diag_ms >= 500UL && rx_active && !transmitting) {
-            last_diag_ms = now;
-            uint16_t irq = (uint16_t)radio.getIrqFlags();
-            if (irq & RADIOLIB_SX126X_IRQ_CRC_ERR) {
-                diag_crc_err_count++;
-            }
-            if (irq & RADIOLIB_SX126X_IRQ_HEADER_VALID) {
-                diag_hdr_count++;
-            }
-        }
-    }
-
     // Periodic channel/airtime report (only when radio legitimately on)
     if (host_active && radio_on_magic == RADIO_MAGIC) {
         if (now - last_chtm_ms >= CHTM_INTERVAL_MS) {
             last_chtm_ms = now;
             send_chtm(now);
-
-            // RX diagnostics report
-            // status byte: bit0=rx_active, bit1=transmitting, bit2=csma_pending
-            {
-                uint8_t sw_status = (rx_active ? 1 : 0)
-                                  | (transmitting ? 2 : 0)
-                                  | (csma_pending ? 4 : 0);
-                uint8_t diag[11];
-                diag[0]  = (uint8_t)(diag_dio1_count >> 8);
-                diag[1]  = (uint8_t)(diag_dio1_count);
-                diag[2]  = (uint8_t)(diag_rx_pkt_count >> 8);
-                diag[3]  = (uint8_t)(diag_rx_pkt_count);
-                diag[4]  = (uint8_t)(diag_rx_start_fail >> 8);
-                diag[5]  = (uint8_t)(diag_rx_start_fail);
-                diag[6]  = (uint8_t)(diag_crc_err_count >> 8);
-                diag[7]  = (uint8_t)(diag_crc_err_count);
-                diag[8]  = (uint8_t)(diag_hdr_count >> 8);
-                diag[9]  = (uint8_t)(diag_hdr_count);
-                diag[10] = sw_status;
-                kiss_send(CMD_STAT_CSMA, diag, 11);
-            }
         }
     }
 

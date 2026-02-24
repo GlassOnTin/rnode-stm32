@@ -58,7 +58,7 @@
 
 // Firmware version
 #define FW_MAJ 1
-#define FW_MIN 61
+#define FW_MIN 62
 
 // Error codes
 #define ERROR_INITRADIO     0x01
